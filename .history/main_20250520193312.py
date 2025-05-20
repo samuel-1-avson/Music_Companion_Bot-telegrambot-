@@ -1,6 +1,6 @@
 import os
 import logging
-import requests # Still used for some sync Spotify calls, and by lyricsgenius
+import requests
 import sys
 import re
 import json
@@ -11,7 +11,7 @@ import atexit
 from typing import Dict, List, Optional, Tuple, Any, Union
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
-from tenacity import retry, stop_after_attempt, wait_exponential, AsyncRetrying
+from tenacity import retry, stop_after_attempt, wait_exponential, AsyncRetrying # For async retry
 from telegram.error import TimedOut, NetworkError
 import httpx
 import asyncio
@@ -26,7 +26,7 @@ from telegram.ext import (
 from functools import lru_cache
 # API clients
 import yt_dlp
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI # CHANGED to AsyncOpenAI
 import importlib
 if importlib.util.find_spec("lyricsgenius") is not None:
     import lyricsgenius
@@ -45,16 +45,16 @@ SPOTIFY_REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI", "https://your-callback-
 # Enable logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO # Consider logging.DEBUG for development
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
 # Initialize clients
-client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-genius = lyricsgenius.Genius(GENIUS_ACCESS_TOKEN, timeout=20, retries=3, sleep_time=0.5) if GENIUS_ACCESS_TOKEN and lyricsgenius else None
+client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None # CHANGED to AsyncOpenAI
+genius = lyricsgenius.Genius(GENIUS_ACCESS_TOKEN, timeout=15, retries=3) if GENIUS_ACCESS_TOKEN and lyricsgenius else None
 
 # Conversation states
-MOOD, PREFERENCE, ACTION, SPOTIFY_CODE = range(4) # ACTION state currently unused in handlers
+MOOD, PREFERENCE, ACTION, SPOTIFY_CODE = range(4)
 
 # Track active downloads and user contexts
 active_downloads = set()
@@ -62,64 +62,49 @@ user_contexts: Dict[int, Dict] = {}
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+
 def sanitize_input(text: str) -> str:
-    if not text: return ""
+    """Sanitize user input to prevent injection and clean text."""
+    if not text:
+        return ""
+    # Remove potentially dangerous characters and trim
     return re.sub(r'[<>;&]', '', text.strip())[:200]
 
-# ==================== SPOTIFY HELPER FUNCTIONS ====================
+# ==================== SPOTIFY HELPER FUNCTIONS (Mostly Sync for now) ====================
+# NOTE: For full async, these need to be converted to use httpx.AsyncClient and 'await'
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=6))
-async def get_spotify_token_async() -> Optional[str]:
+async def get_spotify_token_async() -> Optional[str]: # Made this one async as an example
+    """Get Spotify access token using client credentials asynchronously."""
     if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
-        logger.warning("Spotify credentials not configured for client token")
+        logger.warning("Spotify credentials not configured")
         return None
+
     auth_string = f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}"
-    auth_base64 = str(base64.b64encode(auth_string.encode("utf-8")), "utf-8")
+    auth_bytes = auth_string.encode("utf-8")
+    auth_base64 = str(base64.b64encode(auth_bytes), "utf-8")
+
     url = "https://accounts.spotify.com/api/token"
-    headers = {"Authorization": f"Basic {auth_base64}", "Content-Type": "application/x-www-form-urlencoded"}
+    headers = {
+        "Authorization": f"Basic {auth_base64}",
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
     data = {"grant_type": "client_credentials"}
+
     try:
-        async with httpx.AsyncClient(timeout=10.0) as http_client: # Standard timeout for this
+        async with httpx.AsyncClient() as http_client:
             response = await http_client.post(url, headers=headers, data=data)
             response.raise_for_status()
         return response.json().get("access_token")
     except httpx.HTTPStatusError as e:
-        logger.error(f"HTTP Error getting Spotify client token: {e.response.status_code} - {e.response.text if e.response else 'No text'}")
+        logger.error(f"Error getting Spotify token (HTTPStatusError): {e.response.text if e.response else 'No response text'}")
         return None
     except httpx.RequestError as e:
-        logger.error(f"Request Error getting Spotify client token: {e}")
+        logger.error(f"Error getting Spotify token (RequestError): {e}")
         return None
     except Exception as e:
-        logger.error(f"Unexpected error getting Spotify client token: {e}", exc_info=True)
+        logger.error(f"Unexpected error getting Spotify token: {e}", exc_info=True)
         return None
-
-# SYNC version - run in thread if called from async
-def get_user_spotify_token(user_id: int, code: str) -> Optional[Dict]:
-    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET or not SPOTIFY_REDIRECT_URI:
-        logger.warning(f"Spotify OAuth credentials not configured for user {user_id}")
-        return None
-    url = "https://accounts.spotify.com/api/token"
-    headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}'.encode()).decode()}",
-        "Content-Type": "application/x-www-form-urlencoded"}
-    data = {"grant_type": "authorization_code", "code": code, "redirect_uri": SPOTIFY_REDIRECT_URI}
-    try:
-        logger.info(f"Attempting to get user Spotify token for user {user_id}.")
-        response = requests.post(url, headers=headers, data=data, timeout=15) # Sync request timeout
-        response.raise_for_status()
-        token_data = response.json()
-        token_data["expires_at"] = (datetime.now(pytz.UTC) + timedelta(seconds=token_data.get("expires_in", 3600))).timestamp()
-        logger.info(f"Successfully obtained user Spotify token for user {user_id}.")
-        return token_data
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"HTTP error ({e.response.status_code}) getting user Spotify token for {user_id}: {e.response.text if e.response else 'No body'}")
-        return None
-    except requests.exceptions.RequestException as e:
-        logger.error(f"RequestException getting user Spotify token for {user_id}: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Unexpected error in get_user_spotify_token for {user_id}: {e}", exc_info=True)
-        return None
-
 
 # This sync version is largely a placeholder if full async conversion isn't immediate.
 # If `get_spotify_token_async` is used, this one isn't strictly necessary unless other sync parts depend on it.

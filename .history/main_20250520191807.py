@@ -1,6 +1,6 @@
 import os
 import logging
-import requests # Still used for some sync Spotify calls, and by lyricsgenius
+import requests
 import sys
 import re
 import json
@@ -11,7 +11,7 @@ import atexit
 from typing import Dict, List, Optional, Tuple, Any, Union
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
-from tenacity import retry, stop_after_attempt, wait_exponential, AsyncRetrying
+from tenacity import retry, stop_after_attempt, wait_exponential, AsyncRetrying # For async retry
 from telegram.error import TimedOut, NetworkError
 import httpx
 import asyncio
@@ -26,7 +26,7 @@ from telegram.ext import (
 from functools import lru_cache
 # API clients
 import yt_dlp
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI # CHANGED to AsyncOpenAI
 import importlib
 if importlib.util.find_spec("lyricsgenius") is not None:
     import lyricsgenius
@@ -45,16 +45,16 @@ SPOTIFY_REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI", "https://your-callback-
 # Enable logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO # Consider logging.DEBUG for development
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
 # Initialize clients
-client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-genius = lyricsgenius.Genius(GENIUS_ACCESS_TOKEN, timeout=20, retries=3, sleep_time=0.5) if GENIUS_ACCESS_TOKEN and lyricsgenius else None
+client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None # CHANGED to AsyncOpenAI
+genius = lyricsgenius.Genius(GENIUS_ACCESS_TOKEN, timeout=15, retries=3) if GENIUS_ACCESS_TOKEN and lyricsgenius else None
 
 # Conversation states
-MOOD, PREFERENCE, ACTION, SPOTIFY_CODE = range(4) # ACTION state currently unused in handlers
+MOOD, PREFERENCE, ACTION, SPOTIFY_CODE = range(4)
 
 # Track active downloads and user contexts
 active_downloads = set()
@@ -62,90 +62,75 @@ user_contexts: Dict[int, Dict] = {}
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+
 def sanitize_input(text: str) -> str:
-    if not text: return ""
+    """Sanitize user input to prevent injection and clean text."""
+    if not text:
+        return ""
+    # Remove potentially dangerous characters and trim
     return re.sub(r'[<>;&]', '', text.strip())[:200]
 
-# ==================== SPOTIFY HELPER FUNCTIONS ====================
+# ==================== SPOTIFY HELPER FUNCTIONS (Mostly Sync for now) ====================
+# NOTE: For full async, these need to be converted to use httpx.AsyncClient and 'await'
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=6))
-async def get_spotify_token_async() -> Optional[str]:
-    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
-        logger.warning("Spotify credentials not configured for client token")
-        return None
-    auth_string = f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}"
-    auth_base64 = str(base64.b64encode(auth_string.encode("utf-8")), "utf-8")
-    url = "https://accounts.spotify.com/api/token"
-    headers = {"Authorization": f"Basic {auth_base64}", "Content-Type": "application/x-www-form-urlencoded"}
-    data = {"grant_type": "client_credentials"}
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as http_client: # Standard timeout for this
-            response = await http_client.post(url, headers=headers, data=data)
-            response.raise_for_status()
-        return response.json().get("access_token")
-    except httpx.HTTPStatusError as e:
-        logger.error(f"HTTP Error getting Spotify client token: {e.response.status_code} - {e.response.text if e.response else 'No text'}")
-        return None
-    except httpx.RequestError as e:
-        logger.error(f"Request Error getting Spotify client token: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Unexpected error getting Spotify client token: {e}", exc_info=True)
-        return None
-
-# SYNC version - run in thread if called from async
-def get_user_spotify_token(user_id: int, code: str) -> Optional[Dict]:
-    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET or not SPOTIFY_REDIRECT_URI:
-        logger.warning(f"Spotify OAuth credentials not configured for user {user_id}")
-        return None
-    url = "https://accounts.spotify.com/api/token"
-    headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}'.encode()).decode()}",
-        "Content-Type": "application/x-www-form-urlencoded"}
-    data = {"grant_type": "authorization_code", "code": code, "redirect_uri": SPOTIFY_REDIRECT_URI}
-    try:
-        logger.info(f"Attempting to get user Spotify token for user {user_id}.")
-        response = requests.post(url, headers=headers, data=data, timeout=15) # Sync request timeout
-        response.raise_for_status()
-        token_data = response.json()
-        token_data["expires_at"] = (datetime.now(pytz.UTC) + timedelta(seconds=token_data.get("expires_in", 3600))).timestamp()
-        logger.info(f"Successfully obtained user Spotify token for user {user_id}.")
-        return token_data
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"HTTP error ({e.response.status_code}) getting user Spotify token for {user_id}: {e.response.text if e.response else 'No body'}")
-        return None
-    except requests.exceptions.RequestException as e:
-        logger.error(f"RequestException getting user Spotify token for {user_id}: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Unexpected error in get_user_spotify_token for {user_id}: {e}", exc_info=True)
-        return None
-
-
-# This sync version is largely a placeholder if full async conversion isn't immediate.
-# If `get_spotify_token_async` is used, this one isn't strictly necessary unless other sync parts depend on it.
-def get_spotify_token() -> Optional[str]:
-    """Get Spotify access token using client credentials."""
+async def get_spotify_token_async() -> Optional[str]: # Made this one async as an example
+    """Get Spotify access token using client credentials asynchronously."""
     if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
         logger.warning("Spotify credentials not configured")
         return None
-    # ... (rest of the synchronous implementation) ...
+
     auth_string = f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}"
     auth_bytes = auth_string.encode("utf-8")
     auth_base64 = str(base64.b64encode(auth_bytes), "utf-8")
+
     url = "https://accounts.spotify.com/api/token"
     headers = {
         "Authorization": f"Basic {auth_base64}",
         "Content-Type": "application/x-www-form-urlencoded"
     }
     data = {"grant_type": "client_credentials"}
+
+    try:
+        async with httpx.AsyncClient() as http_client:
+            response = await http_client.post(url, headers=headers, data=data)
+            response.raise_for_status()
+        return response.json().get("access_token")
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Error getting Spotify token (HTTPStatusError): {e.response.text if e.response else 'No response text'}")
+        return None
+    except httpx.RequestError as e:
+        logger.error(f"Error getting Spotify token (RequestError): {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error getting Spotify token: {e}", exc_info=True)
+        return None
+
+# Kept sync for now as a placeholder, if `get_spotify_token_async` is used, this one isn't
+def get_spotify_token() -> Optional[str]:
+    """Get Spotify access token using client credentials."""
+    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
+        logger.warning("Spotify credentials not configured")
+        return None
+
+    auth_string = f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}"
+    auth_bytes = auth_string.encode("utf-8")
+    auth_base64 = str(base64.b64encode(auth_bytes), "utf-8")
+
+    url = "https://accounts.spotify.com/api/token"
+    headers = {
+        "Authorization": f"Basic {auth_base64}",
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+    data = {"grant_type": "client_credentials"}
+
     try:
         response = requests.post(url, headers=headers, data=data)
         response.raise_for_status()
         return response.json().get("access_token")
     except requests.exceptions.RequestException as e:
-        logger.error(f"Error getting Spotify token (sync): {e}")
+        logger.error(f"Error getting Spotify token: {e}")
         return None
-
 
 def search_spotify_track(token: str, query: str) -> Optional[Dict]:
     """Search for a track on Spotify."""
@@ -170,7 +155,7 @@ async def get_spotify_recommendations_async(token: str, seed_tracks: List[str], 
         return []
     url = "https://api.spotify.com/v1/recommendations"
     headers = {"Authorization": f"Bearer {token}"}
-    params = {"seed_tracks": ",".join(list(set(seed_tracks))[:5]), "limit": limit} # Use unique seed IDs, max 5 seed entities
+    params = {"seed_tracks": ",".join(seed_tracks[:2]), "limit": limit} # Max 5 seed entities, so 2 tracks is fine.
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(url, headers=headers, params=params)
@@ -186,10 +171,8 @@ async def get_spotify_recommendations_async(token: str, seed_tracks: List[str], 
         logger.error(f"Unexpected error in get_spotify_recommendations: {e}", exc_info=True)
         return []
 
-# This function is used by spotify_code_handler, which runs it in a thread.
-# For full async, this needs to be rewritten with httpx.AsyncClient.
+
 def get_user_spotify_token(user_id: int, code: str) -> Optional[Dict]:
-    """Exchange authorization code for Spotify access and refresh tokens. (SYNC for now)"""
     if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET or not SPOTIFY_REDIRECT_URI:
         logger.warning("Spotify OAuth credentials not configured")
         return None
@@ -200,23 +183,16 @@ def get_user_spotify_token(user_id: int, code: str) -> Optional[Dict]:
     }
     data = {"grant_type": "authorization_code", "code": code, "redirect_uri": SPOTIFY_REDIRECT_URI}
     try:
-        logger.info(f"Attempting to get user Spotify token for user {user_id} with code.")
         response = requests.post(url, headers=headers, data=data)
         response.raise_for_status()
         token_data = response.json()
         token_data["expires_at"] = (datetime.now(pytz.UTC) + timedelta(seconds=token_data.get("expires_in", 3600))).timestamp()
-        logger.info(f"Successfully obtained user Spotify token for user {user_id}.")
         return token_data
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"HTTP error getting user Spotify token for user {user_id}: {e.response.status_code} - {e.response.text if e.response else 'No response body'}")
-        return None
     except requests.exceptions.RequestException as e:
-        logger.error(f"RequestException getting user Spotify token for user {user_id}: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Unexpected error in get_user_spotify_token for user {user_id}: {e}", exc_info=True)
+        logger.error(f"Error getting user Spotify token: {e}")
         return None
 
+# This is the single, improved refresh_spotify_token function
 async def refresh_spotify_token_async(user_id: int) -> Optional[str]:
     context = user_contexts.get(user_id, {})
     refresh_token_val = context.get("spotify", {}).get("refresh_token")
@@ -238,18 +214,22 @@ async def refresh_spotify_token_async(user_id: int) -> Optional[str]:
         token_data = response.json()
         expires_at = (datetime.now(pytz.UTC) + timedelta(seconds=token_data.get("expires_in", 3600))).timestamp()
         
-        user_contexts.setdefault(user_id, {}).setdefault("spotify", {}).update({
+        # Ensure user_contexts[user_id]['spotify'] exists
+        if "spotify" not in user_contexts.get(user_id, {}):
+            user_contexts.setdefault(user_id, {}).setdefault("spotify", {})
+
+        user_contexts[user_id]["spotify"].update({
             "access_token": token_data.get("access_token"),
-            "refresh_token": token_data.get("refresh_token", refresh_token_val), 
+            "refresh_token": token_data.get("refresh_token", refresh_token_val), # Persist old refresh token if new one not provided
             "expires_at": expires_at
         })
         logger.info(f"Successfully refreshed Spotify token for user {user_id}")
         return token_data.get("access_token")
     except httpx.HTTPStatusError as e:
-        if e.response and e.response.status_code == 400:
+        if e.response and e.response.status_code == 400: # Check if e.response exists
             logger.error(f"Invalid refresh token or bad request for user {user_id}: {e.response.text if e.response else 'No response body'}. Clearing Spotify context.")
             if user_id in user_contexts and "spotify" in user_contexts[user_id]:
-                 user_contexts[user_id]["spotify"] = {}
+                 user_contexts[user_id]["spotify"] = {}  # Clear invalid token data
             return None
         logger.error(f"HTTP error refreshing Spotify token for user {user_id}: {e}")
         return None
@@ -269,7 +249,7 @@ async def get_user_spotify_data_async(user_id: int, endpoint: str) -> Optional[L
     if not access_token or (expires_at and datetime.now(pytz.UTC).timestamp() > expires_at):
         access_token = await refresh_spotify_token_async(user_id)
         if not access_token:
-            return [] 
+            return [] # Changed to return empty list
 
     url = f"https://api.spotify.com/v1/me/{endpoint}"
     headers = {"Authorization": f"Bearer {access_token}"}
@@ -302,7 +282,7 @@ async def get_user_spotify_playlists_async(user_id: int) -> Optional[List[Dict]]
 
     url = "https://api.spotify.com/v1/me/playlists"
     headers = {"Authorization": f"Bearer {access_token}"}
-    params = {"limit": 10}
+    params = {"limit": 10} # Fetch a few playlists
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(url, headers=headers, params=params)
@@ -321,7 +301,6 @@ async def get_user_spotify_playlists_async(user_id: int) -> Optional[List[Dict]]
 
 @lru_cache(maxsize=50)
 def get_lyrics(song_title: str, artist_name: Optional[str] = None) -> str:
-    # ... (get_lyrics implementation from previous full code, no changes needed here)
     if not genius:
         return "Lyrics service (Genius) is not configured or available."
     try:
@@ -347,6 +326,15 @@ def get_lyrics(song_title: str, artist_name: Optional[str] = None) -> str:
                 lyrics = lyrics.lower().split("you might also like")[0].strip()
             
             cleaned_lyrics = lyrics.strip()
+            # Remove trailing metadata often found after actual lyrics
+            # common_end_phrases = ["embed", "lyrics", "contributors", "track info"]
+            # for phrase in common_end_phrases:
+            #     if phrase in cleaned_lyrics.lower()[-100:]: # Check last 100 chars
+            #         # Attempt to split before it, if it seems like metadata
+            #         parts = re.split(rf'\b{phrase}\b', cleaned_lyrics, maxsplit=1, flags=re.IGNORECASE)
+            #         if len(parts) > 1 and len(parts[0]) > 0.5 * len(cleaned_lyrics): # Heuristic: if it removes less than half
+            #             cleaned_lyrics = parts[0].strip()
+            
             return cleaned_lyrics if cleaned_lyrics else "Lyrics not found or are empty after cleaning."
         return "Lyrics not found for this song."
     except requests.exceptions.Timeout:
@@ -356,8 +344,8 @@ def get_lyrics(song_title: str, artist_name: Optional[str] = None) -> str:
         logger.error(f"Error fetching lyrics from Genius for '{song_title}' by '{artist_name}': {e}", exc_info=True)
         return "Sorry, an error occurred while fetching lyrics."
 
+
 async def recommend_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # ... (recommend_music implementation from previous full code, no changes needed here)
     user_id = update.effective_user.id
     status_msg = await update.message.reply_text("🎧 Finding personalized music recommendations...")
 
@@ -369,9 +357,10 @@ async def recommend_music(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if user_access_token and user_s_data.get("expires_at") and \
            datetime.now(pytz.UTC).timestamp() > user_s_data["expires_at"]:
             logger.info(f"Spotify token expired for user {user_id}, attempting refresh.")
-            user_access_token = await refresh_spotify_token_async(user_id) 
+            user_access_token = await refresh_spotify_token_async(user_id) # This updates user_contexts
 
-        if user_access_token: 
+        # Update Spotify data in user_contexts using user's token
+        if user_access_token: # Only if user has an active (or refreshed) token
             recently_played = await get_user_spotify_data_async(user_id, "player/recently-played")
             if recently_played is not None: user_contexts.setdefault(user_id, {}).setdefault("spotify", {})["recently_played"] = recently_played
             
@@ -380,17 +369,19 @@ async def recommend_music(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             
             playlists = await get_user_spotify_playlists_async(user_id)
             if playlists is not None: user_contexts.setdefault(user_id, {}).setdefault("spotify", {})["playlists"] = playlists
-        else: 
+        else: # User doesn't have a valid token
             logger.info(f"User {user_id} has no valid Spotify token for personalized data.")
-            if "spotify" in user_contexts.get(user_id, {}): # Clear stale data
+            # Clear any stale data if token is gone
+            if "spotify" in user_contexts.get(user_id, {}):
                 user_contexts[user_id]["spotify"].pop("recently_played", None)
                 user_contexts[user_id]["spotify"].pop("top_tracks", None)
                 user_contexts[user_id]["spotify"].pop("playlists", None)
 
-        analysis = await analyze_conversation(user_id) 
+        analysis = await analyze_conversation(user_id) # Uses user_contexts which might now be updated
         mood = analysis.get("mood")
-        if not mood: 
+        if not mood: # Prompt for mood if not determined
             await status_msg.delete()
+            # ... (mood prompt keyboard as before) ...
             keyboard = [
                 [ InlineKeyboardButton("Happy 😊", callback_data="mood_happy"), InlineKeyboardButton("Sad 😢", callback_data="mood_sad")],
                 [ InlineKeyboardButton("Energetic 💪", callback_data="mood_energetic"), InlineKeyboardButton("Relaxed 😌", callback_data="mood_relaxed")],
@@ -404,6 +395,7 @@ async def recommend_music(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         search_query = sanitize_input(f"{mood} {' '.join(genres[:1])} music {'like ' + artists[0] if artists else ''}")
         
         seed_track_ids = []
+        # Use freshly fetched data from user_contexts for seed tracks
         current_spotify_context = user_contexts.get(user_id, {}).get("spotify", {})
         if current_spotify_context.get("recently_played"):
             tracks = current_spotify_context["recently_played"]
@@ -417,9 +409,10 @@ async def recommend_music(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             first_playlist = current_spotify_context["playlists"][0]
             playlist_id = first_playlist.get("id")
             if playlist_id:
+                # This specific call requires user's access token to get their playlist's tracks
                 url = f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks"
                 headers = {"Authorization": f"Bearer {user_access_token}"}
-                params = {"limit": 2, "fields": "items(track(id))"} 
+                params = {"limit": 2, "fields": "items(track(id))"} # Optimize fields
                 try:
                     async with httpx.AsyncClient() as http_client:
                         res = await http_client.get(url, headers=headers, params=params)
@@ -429,8 +422,9 @@ async def recommend_music(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 except Exception as e:
                     logger.warning(f"Could not fetch tracks from user playlist {playlist_id}: {e}")
         
+        # Use client_credentials_token for /recommendations endpoint
         if client_credentials_token and seed_track_ids:
-            recommendations = await get_spotify_recommendations_async(client_credentials_token, list(set(seed_track_ids))[:5])
+            recommendations = await get_spotify_recommendations_async(client_credentials_token, list(set(seed_track_ids))[:5]) # Use unique seed IDs, max 5
             if recommendations:
                 response_text = "🎵 <b>Personalized Spotify Recommendations:</b>\n\n"
                 for i, track in enumerate(recommendations[:5], 1):
@@ -443,8 +437,10 @@ async def recommend_music(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await status_msg.edit_text(response_text, parse_mode=ParseMode.HTML)
                 return
 
-        results = search_youtube(search_query, max_results=5) 
+        # Fallback to YouTube search
+        results = search_youtube(search_query, max_results=5) # This is sync
         if results:
+            # ... (YouTube results display as before) ...
             response_text = f"🎵 <b>Recommended music for you (from YouTube):</b>\n\n"
             keyboard_yt = []
             for i, result in enumerate(results[:5], 1):
@@ -467,7 +463,7 @@ async def recommend_music(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await status_msg.edit_text("I couldn't get personalized recommendations right now. Please try again.")
 
 # ==================== YOUTUBE HELPER FUNCTIONS ====================
-# ... (is_valid_youtube_url, sanitize_filename, download_youtube_audio, search_youtube (cached) - no changes) ...
+
 def is_valid_youtube_url(url: str) -> bool:
     if not url: return False
     patterns = [
@@ -510,7 +506,7 @@ def download_youtube_audio(url: str) -> Dict[str, Any]:
             file_size_mb = os.path.getsize(audio_path) / (1024 * 1024)
             if file_size_mb > 50:
                 logger.error(f"File too large: {file_size_mb:.2f} MB")
-                if os.path.exists(audio_path): os.remove(audio_path) 
+                os.remove(audio_path) # Clean up oversized file
                 return {"success": False, "error": "File too large for Telegram (max 50 MB)"}
             return {"success": True, "title": title, "artist": artist, 
                     "thumbnail_url": info.get('thumbnail', ''), 
@@ -522,6 +518,7 @@ def download_youtube_audio(url: str) -> Dict[str, Any]:
         logger.error(f"Unexpected error downloading YouTube audio: {e}", exc_info=True)
         return {"success": False, "error": "An unexpected error occurred during download"}
 
+# This is the single, cached search_youtube function
 @lru_cache(maxsize=100)
 def search_youtube(query: str, max_results: int = 5) -> List[Dict]:
     query = sanitize_input(query)
@@ -552,7 +549,7 @@ def search_youtube(query: str, max_results: int = 5) -> List[Dict]:
         return []
 
 # ==================== AI CONVERSATION FUNCTIONS ====================
-# ... (generate_chat_response, get_lyrics_command (single), detect_music_in_message, is_music_request, analyze_conversation - no changes)
+
 async def generate_chat_response(user_id: int, message: str) -> str:
     if not client:
         return "I'm having trouble connecting to my AI service. Please try again later."
@@ -578,7 +575,7 @@ async def generate_chat_response(user_id: int, message: str) -> str:
                isinstance(item["track"].get("artists"), list) and item["track"]["artists"] and \
                isinstance(item["track"]["artists"][0], dict) and item["track"]["artists"][0].get("name"):
                 valid_artists.append(item["track"]["artists"][0]["name"])
-        if valid_artists: system_prompt_additions.append(f"They recently listened to artists: {', '.join(list(set(valid_artists))[:3])}.") 
+        if valid_artists: system_prompt_additions.append(f"They recently listened to artists: {', '.join(list(set(valid_artists))[:3])}.") # Unique artists
 
     if system_prompt_additions: messages_payload.append({"role": "system", "content": " ".join(system_prompt_additions)})
 
@@ -598,6 +595,7 @@ async def generate_chat_response(user_id: int, message: str) -> str:
         logger.error(f"Error generating chat response: {e}", exc_info=True)
         return "I'm having trouble thinking right now. Let's talk about music instead!"
 
+# This is the single get_lyrics_command
 async def get_lyrics_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         await update.message.reply_text(
@@ -613,7 +611,7 @@ async def get_lyrics_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if " - " in query: parts = query.split(" - ", 1); artist, song = parts[0].strip(), parts[1].strip()
         elif " by " in query.lower(): parts = query.lower().split(" by ", 1); song, artist = parts[0].strip(), parts[1].strip()
         
-        lyrics_text = get_lyrics(song, artist) 
+        lyrics_text = get_lyrics(song, artist) # Calls the implemented get_lyrics
         
         if len(lyrics_text) > 4000:
             await status_msg.edit_text(lyrics_text[:4000] + "\n\n(Message continues in next part...)")
@@ -622,11 +620,12 @@ async def get_lyrics_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 part = remaining[:4000]; remaining = remaining[4000:]
                 await update.message.reply_text(part + ("\n\n(Continued in next part...)" if remaining else ""))
         else:
-            await status_msg.edit_text(lyrics_text if lyrics_text.strip() else "Sorry, I couldn't find those lyrics or they were empty.")
+            await status_msg.edit_text(lyrics_text if lyrics_text else "Sorry, I couldn't find those lyrics or they were empty.")
     except Exception as e:
         logger.error(f"Error in get_lyrics_command: {e}", exc_info=True)
         await status_msg.edit_text("Sorry, an error occurred while trying to find lyrics.")
 
+# ==================== MUSIC DETECTION FUNCTION ====================
 def detect_music_in_message(text: str) -> Optional[str]:
     patterns = [
         r'play (.*?)(?:by|from|$)', r'find (.*?)(?:by|from|$)',
@@ -648,6 +647,419 @@ def detect_music_in_message(text: str) -> Optional[str]:
             return song_title
     if any(keyword in text_lower for keyword in keywords): return "AI_ANALYSIS_NEEDED"
     return None
+
+# ==================== INLINE KEYBOARD FOR SEARCH RESULTS ====================
+async def send_search_results(update: Update, query: str, results: List[Dict]) -> None:
+    if not results:
+        await update.message.reply_text(f"Sorry, I couldn't find any songs for '{query}'.")
+        return
+    keyboard_buttons = []
+    for i, result in enumerate(results):
+        duration_str = ""
+        if result.get('duration'):
+            minutes, seconds = divmod(int(result['duration']), 60)
+            duration_str = f" [{minutes}:{seconds:02d}]"
+        title = result['title'][:37] + "..." if len(result['title']) > 40 else result['title']
+        button_text = f"{i+1}. {title}{duration_str}"
+        if result.get('id') and re.match(r'^[0-9A-Za-z_-]{11}$', result['id']): # Validate ID
+            keyboard_buttons.append([InlineKeyboardButton(button_text, callback_data=f"download_{result['id']}")])
+    if not keyboard_buttons:
+        await update.message.reply_text(f"Sorry, no valid downloadable tracks found for '{query}'.")
+        return
+    keyboard_buttons.append([InlineKeyboardButton("Cancel", callback_data="cancel_search")])
+    reply_markup = InlineKeyboardMarkup(keyboard_buttons)
+    await update.message.reply_text(
+        f"🔎 Search results for '{query}':\n\nClick on a song to download:",
+        reply_markup=reply_markup)
+
+async def auto_download_first_result(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str) -> None:
+    user_id = update.effective_user.id
+    async with download_lock: # Ensure this lock usage is correct for its intent
+        if user_id in active_downloads:
+            await update.message.reply_text("⚠️ You already have a download in progress. Please wait.")
+            return
+        active_downloads.add(user_id)
+    status_msg = await update.message.reply_text(f"🔍 Searching for '{query}'...")
+    try:
+        results = search_youtube(query, max_results=1)
+        if not results or not results[0].get('id') or not re.match(r'^[0-9A-Za-z_-]{11}$', results[0]['id']):
+            await status_msg.edit_text(f"❌ Couldn't find a valid result for '{query}'.")
+            return # No active_downloads.remove here, as it's handled in finally
+        result = results[0]
+        video_url = result["url"]
+        await status_msg.edit_text(f"✅ Found: {result['title']}\n⏳ Downloading...")
+        download_result = download_youtube_audio(video_url) # This is sync
+        if not download_result["success"]:
+            await status_msg.edit_text(f"❌ Download failed: {download_result['error']}")
+            return
+        await status_msg.edit_text(f"✅ Downloaded: {download_result['title']}\n⏳ Sending file...")
+        with open(download_result["audio_path"], 'rb') as audio:
+            await update.message.reply_audio(
+                audio=audio,
+                title=download_result["title"][:64],
+                performer=download_result["artist"][:64] if download_result.get("artist") else "Unknown Artist",
+                caption=f"🎵 {download_result['title']}")
+        if os.path.exists(download_result["audio_path"]):
+            try: os.remove(download_result["audio_path"]); logger.info(f"Deleted file: {download_result['audio_path']}")
+            except Exception as e: logger.error(f"Error deleting file: {e}")
+        await status_msg.delete()
+    except Exception as e:
+        logger.error(f"Error in auto_download_first_result: {e}", exc_info=True)
+        if status_msg: await status_msg.edit_text(f"❌ Error: {str(e)[:200]}")
+    finally:
+        async with download_lock:
+            if user_id in active_downloads: active_downloads.remove(user_id)
+
+# ==================== TELEGRAM BOT HANDLERS ====================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    await update.message.reply_text(
+        f"Hi {user.first_name}! 👋 I'm MelodyMind, your Music Healing Companion.\n\n"
+        "I can: 🎵 Download music 📜 Find lyrics 💿 Recommend music "
+        "💬 Chat about music & feelings 🔗 Link Spotify for personalized experience.\n\n"
+        "Try /help for commands, or just chat!")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    help_text = (
+        "🎶 <b>MelodyMind Commands</b> 🎶\n"
+        "/start - Welcome\n/help - This message\n"
+        "/download [YouTube URL] or just send a link\n"
+        "/autodownload [song name] - Search & DL 1st result\n"
+        "/search [song name] - Show YouTube search options\n"
+        "/lyrics [song name / artist - song]\n"
+        "/recommend - Personalized music recommendations\n"
+        "/mood - Set your current mood\n"
+        "/link_spotify - Connect your Spotify\n"
+        "/clear - Clear my memory of our chat\n\n"
+        "<b>Or just chat naturally!</b> Examples:\n"
+        "- \"I'm feeling sad, suggest some songs.\"\n"
+        "- \"Play Shape of You by Ed Sheeran\"\n"
+        "- \"What are the lyrics to Bohemian Rhapsody?\"")
+    await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
+
+download_lock = asyncio.Lock() # Already defined at module level
+async def download_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    url = None
+    if context.args: url = " ".join(context.args)
+    elif update.message and update.message.text:
+        words = update.message.text.split()
+        valid_urls = [word for word in words if is_valid_youtube_url(word)]
+        if valid_urls: url = valid_urls[0]
+    
+    if not url or not is_valid_youtube_url(url):
+        await update.message.reply_text("❌ Please provide a valid YouTube URL or send a message containing one.")
+        return
+
+    user_id = update.effective_user.id
+    async with download_lock:
+        if user_id in active_downloads:
+            await update.message.reply_text("⚠️ You already have a download in progress. Please wait.")
+            return
+        active_downloads.add(user_id)
+    status_msg = await update.message.reply_text("⏳ Starting download...")
+    try:
+        await status_msg.edit_text("🔍 Fetching video information...")
+        result = download_youtube_audio(url) # Sync call
+        if not result["success"]:
+            await status_msg.edit_text(f"❌ Download failed: {result['error']}")
+            return # No active_downloads.remove here, handled in finally
+        await status_msg.edit_text(f"✅ Downloaded: {result['title']}\n⏳ Sending file...")
+        with open(result["audio_path"], 'rb') as audio_file:
+            await update.message.reply_audio(
+                audio=audio_file, title=result["title"][:64],
+                performer=result["artist"][:64] if result.get("artist") else "Unknown Artist",
+                caption=f"🎵 {result['title']}")
+        if os.path.exists(result["audio_path"]):
+            try: os.remove(result["audio_path"]); logger.info(f"Deleted file: {result['audio_path']}")
+            except Exception as e: logger.error(f"Error deleting file {result['audio_path']}: {e}")
+        await status_msg.delete()
+    except Exception as e:
+        logger.error(f"Error in download_music: {e}", exc_info=True)
+        if status_msg : await status_msg.edit_text("❌ An error occurred. Please try again.")
+    finally:
+        async with download_lock:
+            if user_id in active_downloads: active_downloads.remove(user_id)
+
+async def link_spotify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET or not SPOTIFY_REDIRECT_URI:
+        await update.message.reply_text("Sorry, Spotify linking is not available (misconfigured).")
+        return ConversationHandler.END
+    user_id = update.effective_user.id
+    auth_url = (f"https://accounts.spotify.com/authorize?client_id={SPOTIFY_CLIENT_ID}"
+                f"&response_type=code&redirect_uri={SPOTIFY_REDIRECT_URI}"
+                f"&scope=user-read-recently-played%20user-top-read%20playlist-read-private" # Corrected scope
+                f"&state={user_id}") # TODO: Implement CSRF protection for state
+    keyboard = [[InlineKeyboardButton("🔗 Link Spotify", url=auth_url)],
+                [InlineKeyboardButton("Cancel", callback_data="cancel_spotify")]]
+    await update.message.reply_text(
+        "🔗 Let's link your Spotify! \n1. Click below. \n2. Log in & authorize. \n3. Copy the code from the page. \n4. Send the code back to me here.",
+        reply_markup=InlineKeyboardMarkup(keyboard))
+    return SPOTIFY_CODE
+
+async def spotify_code_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    code = None
+    if update.message and update.message.text:
+        message_text = update.message.text.strip()
+        if not message_text.startswith('/'): code = message_text
+        elif message_text.startswith('/spotify_code') and context.args: code = context.args[0]
+    
+    if not code:
+        await update.message.reply_text("Please send the Spotify authorization code or use /spotify_code <code>.")
+        return SPOTIFY_CODE
+
+    # This function get_user_spotify_token is still synchronous
+    # To make it fully async, it needs to use httpx and be awaited
+    token_data = await asyncio.to_thread(get_user_spotify_token, user_id, code) # Run sync in thread
+
+    if not token_data or not token_data.get("access_token"):
+        await update.message.reply_text("❌ Failed to link Spotify. Invalid/expired code? Try /link_spotify again.")
+        return SPOTIFY_CODE
+
+    user_contexts.setdefault(user_id, {}).setdefault("spotify", {}).update({
+        "access_token": token_data.get("access_token"),
+        "refresh_token": token_data.get("refresh_token"),
+        "expires_at": token_data.get("expires_at")})
+    
+    # Fetch initial data
+    recently_played = await get_user_spotify_data_async(user_id, "player/recently-played")
+    if recently_played is not None: user_contexts[user_id]["spotify"]["recently_played"] = recently_played
+
+    await update.message.reply_text("✅ Spotify linked! 🎉 Try /recommend for personalized suggestions.")
+    return ConversationHandler.END
+
+async def spotify_code_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Please provide the code: /spotify_code <code>")
+        return
+    await spotify_code_handler(update, context) # Reuses logic
+
+async def cancel_spotify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Spotify linking cancelled. /link_spotify to try again.")
+    return ConversationHandler.END
+
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("What to search? /search Shape of You Ed Sheeran")
+        return
+    query = " ".join(context.args)
+    status_msg = await update.message.reply_text(f"🔍 Searching YouTube for: '{query}'...")
+    results = search_youtube(query) # Sync
+    await status_msg.delete()
+    await send_search_results(update, query, results)
+
+async def auto_download_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("What song? /autodownload Shape of You Ed Sheeran")
+        return
+    query = " ".join(context.args)
+    await auto_download_first_result(update, context, query)
+
+async def provide_generic_recommendations(update: Update, mood: str) -> None:
+    mood_recommendations = {
+        "happy": ["Walking on Sunshine - Katrina & The Waves", "Happy - Pharrell Williams"],
+        "sad": ["Someone Like You - Adele", "Fix You - Coldplay"],
+        "energetic": ["Eye of the Tiger - Survivor", "Don't Stop Me Now - Queen"],
+        "relaxed": ["Weightless - Marconi Union", "Clair de Lune - Claude Debussy"],
+        "focused": ["The Four Seasons - Vivaldi", "Time - Hans Zimmer"],
+        "nostalgic": ["Yesterday - The Beatles", "Vienna - Billy Joel"]
+    } # Shortened for brevity
+    recommendations = mood_recommendations.get(mood.lower(), mood_recommendations["happy"])
+    response = f"🎵 <b>Some {mood.capitalize()} music ideas:</b>\n" + "\n".join([f"{i+1}. {track}" for i, track in enumerate(recommendations)])
+    response += "\n\n💡 <i>Send a YouTube link to download!</i>"
+    if update.callback_query: # If called from button handler that edited message
+        await update.callback_query.message.edit_text(response, parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text(response, parse_mode=ParseMode.HTML)
+
+async def set_mood(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    keyboard = [
+        [InlineKeyboardButton("Happy 😊", callback_data="mood_happy"), InlineKeyboardButton("Sad 😢", callback_data="mood_sad")],
+        [InlineKeyboardButton("Energetic 💪", callback_data="mood_energetic"), InlineKeyboardButton("Relaxed 😌", callback_data="mood_relaxed")],
+        [InlineKeyboardButton("Focused 🧠", callback_data="mood_focused"), InlineKeyboardButton("Nostalgic 🕰️", callback_data="mood_nostalgic")],
+    ]
+    await update.message.reply_text("How are you feeling today?", reply_markup=InlineKeyboardMarkup(keyboard))
+    return MOOD
+
+async def enhanced_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Union[int, None]:
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = query.from_user.id
+    logger.debug(f"Callback: {data} for user {user_id}")
+
+    if data.startswith("mood_"):
+        mood = data.split("_")[1]
+        user_contexts.setdefault(user_id, {}).update({"mood": mood, "preferences": user_contexts.get(user_id, {}).get("preferences", [])})
+        keyboard_genres = [
+            [InlineKeyboardButton("Pop", callback_data="pref_pop"), InlineKeyboardButton("Rock", callback_data="pref_rock"), InlineKeyboardButton("Hip-Hop", callback_data="pref_hiphop")],
+            [InlineKeyboardButton("Classical", callback_data="pref_classical"), InlineKeyboardButton("Electronic", callback_data="pref_electronic"), InlineKeyboardButton("Jazz", callback_data="pref_jazz")],
+            [InlineKeyboardButton("Skip", callback_data="pref_skip")],]
+        await query.edit_message_text(f"Got it! You're feeling {mood}. 🎶\n\nAny specific music genre preference?", reply_markup=InlineKeyboardMarkup(keyboard_genres))
+        return PREFERENCE
+    elif data.startswith("pref_"):
+        preference = data.split("_")[1]
+        if preference != "skip": user_contexts.setdefault(user_id, {}).setdefault("preferences", []).append(preference) # Appends, might want to replace
+        await query.edit_message_text("Great! Try /recommend, /download, /lyrics, or just chat!")
+        return ConversationHandler.END
+    elif data.startswith("download_") or data.startswith("auto_download_"):
+        video_id = data.split("_")[-1] # Gets last part, e.g. auto_download_VIDEOID -> VIDEOID
+        if not re.match(r'^[0-9A-Za-z_-]{11}$', video_id):
+            logger.error(f"Invalid YouTube video ID from callback: {video_id}")
+            await query.edit_message_text("❌ Invalid video ID. Try another song.")
+            return None
+        
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        await query.edit_message_text(f"⏳ Starting download for {url.split('v=')[-1]}...")
+        
+        # This part needs to be careful with `active_downloads` and the global `download_lock`
+        async with download_lock:
+            if user_id in active_downloads:
+                await query.edit_message_text("⚠️ You already have a download in progress. Please wait.")
+                return None
+            active_downloads.add(user_id)
+        try:
+            result = await asyncio.to_thread(download_youtube_audio, url) # Run sync download in thread
+            if not result["success"]:
+                await query.edit_message_text(f"❌ Download failed: {result['error']}")
+                return None
+            await query.edit_message_text(f"✅ Downloaded: {result['title']}\n⏳ Sending file...")
+            # Retry send_audio part (as you had before)
+            @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+            async def send_audio_with_retry_cb():
+                async with httpx.AsyncClient(timeout=60.0) as temp_client:
+                    original_bot_client = context.bot.request._client
+                    context.bot.request._client = temp_client
+                    try:
+                        with open(result["audio_path"], 'rb') as audio_file_cb:
+                            return await context.bot.send_audio(
+                                chat_id=query.message.chat_id, audio=audio_file_cb,
+                                title=result["title"][:64],
+                                performer=result["artist"][:64] if result.get("artist") else "Unknown Artist",
+                                caption=f"🎵 {result['title']}")
+                    finally: context.bot.request._client = original_bot_client
+            
+            await send_audio_with_retry_cb()
+            
+            @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=5))
+            async def edit_final_message():
+                 await query.edit_message_text(f"✅ Download complete: {result['title']}")
+
+            if os.path.exists(result["audio_path"]):
+                try: os.remove(result["audio_path"]); logger.info(f"Deleted file: {result['audio_path']}")
+                except Exception as e_del: logger.error(f"Error deleting file {result['audio_path']}: {e_del}")
+            await edit_final_message()
+        except Exception as e_btn:
+            logger.error(f"Error in button download for video {video_id}: {e_btn}", exc_info=True)
+            try: await query.edit_message_text(f"❌ Error: {str(e_btn)[:200]}")
+            except Exception: pass # Avoid error cascade
+        finally:
+            async with download_lock:
+                if user_id in active_downloads: active_downloads.remove(user_id)
+        return None
+    elif data.startswith("show_options_"):
+        search_query = data.split("show_options_")[1]
+        results = search_youtube(search_query) # Sync
+        if not results: await query.edit_message_text(f"Sorry, no YouTube songs for '{search_query}'."); return None
+        keyboard_show = []
+        for i, res_item in enumerate(results[:5]):
+            if not res_item.get('id') or not re.match(r'^[0-9A-Za-z_-]{11}$', res_item['id']): continue
+            mins, secs = divmod(int(res_item.get('duration', 0)), 60)
+            dur_str = f" [{mins}:{secs:02d}]"
+            title_disp = res_item['title'][:37] + "..." if len(res_item['title']) > 40 else res_item['title']
+            keyboard_show.append([InlineKeyboardButton(f"{i+1}. {title_disp}{dur_str}", callback_data=f"download_{res_item['id']}")])
+        if not keyboard_show: await query.edit_message_text(f"No valid YouTube results for '{search_query}'."); return None
+        keyboard_show.append([InlineKeyboardButton("Cancel", callback_data="cancel_search")])
+        await query.edit_message_text(f"🔎 Results for '{search_query}':\nClick to download:", reply_markup=InlineKeyboardMarkup(keyboard_show))
+        return None
+    elif data == "cancel_search": await query.edit_message_text("❌ Search cancelled."); return None
+    elif data == "cancel_spotify": await query.edit_message_text("❌ Spotify linking cancelled."); return ConversationHandler.END
+    return None # Default fall-through
+
+# This is the single, improved handle_error function
+async def handle_error(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error(f"Update {update} caused error {context.error}", exc_info=True)
+    if update and update.effective_message:
+        try: await update.effective_message.reply_text("Sorry, something went wrong. Please try again later.")
+        except (TimedOut, NetworkError) as e:
+            logger.error(f"Failed to send error message: {e}")
+            try: await update.effective_chat.send_message("Sorry, something went wrong. Please try again later.")
+            except Exception as e_fallback: logger.error(f"Failed to send fallback error message: {e_fallback}")
+
+async def enhanced_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.text : return # Ignore non-text messages
+    user_id = update.effective_user.id
+    text = sanitize_input(update.message.text)
+    logger.debug(f"Sanitized message from {user_id}: {text[:50]}...")
+
+    # Retry wrappers for Telegram API
+    @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=1, max=3))
+    async def reply_with_retry(msg_text, reply_markup=None):
+        async with httpx.AsyncClient(timeout=20.0) as temp_http_client:
+            original_bot_client = context.bot.request._client
+            context.bot.request._client = temp_http_client
+            try: return await update.message.reply_text(msg_text, reply_markup=reply_markup)
+            finally: context.bot.request._client = original_bot_client
+    @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=1, max=3))
+    async def delete_message_with_retry(message_to_delete):
+        async with httpx.AsyncClient(timeout=10.0) as temp_http_client_del: # Shorter timeout for delete
+            original_bot_client_del = context.bot.request._client
+            context.bot.request._client = temp_http_client_del
+            try: return await message_to_delete.delete()
+            finally: context.bot.request._client = original_bot_client_del
+    try:
+        if is_valid_youtube_url(text):
+            # context.args is usually for commands, direct URL doesn't need it here
+            # await download_music(update, context) # Pass update with full message text
+            # Simplification: if it's a URL, download_music will parse it
+            await download_music(update, context) 
+            return
+
+        detected_song_query = detect_music_in_message(text)
+        if detected_song_query:
+            if detected_song_query == "AI_ANALYSIS_NEEDED":
+                ai_song_detection = await is_music_request(user_id, text)
+                detected_song_query = ai_song_detection.get("song_query") if ai_song_detection.get("is_music_request") else None
+            if detected_song_query:
+                status_msg_search = await reply_with_retry(f"🔍 Searching YouTube for: '{detected_song_query}'...")
+                yt_results = search_youtube(detected_song_query) # Sync
+                if status_msg_search: await delete_message_with_retry(status_msg_search)
+                if not yt_results or not yt_results[0].get('id') or not re.match(r'^[0-9A-Za-z_-]{11}$', yt_results[0]['id']):
+                    await reply_with_retry(f"Sorry, no valid YouTube songs found for '{detected_song_query}'.")
+                    return
+                first_yt_result = yt_results[0]
+                keyboard_confirm = [
+                    [InlineKeyboardButton("✅ Yes, download it", callback_data=f"auto_download_{first_yt_result['id']}")],
+                    [InlineKeyboardButton("👀 Show me options", callback_data=f"show_options_{detected_song_query}")],
+                    [InlineKeyboardButton("❌ No, cancel", callback_data="cancel_search")]]
+                await reply_with_retry(f"Found '{first_yt_result['title']}' by {first_yt_result['uploader']}.\nDownload this?", reply_markup=InlineKeyboardMarkup(keyboard_confirm))
+                return
+        
+        lower_text = text.lower()
+        if any(p in lower_text for p in ["lyrics", "words to", "song that goes"]):
+            song_query_lyrics = text
+            for p_lyric in ["lyrics of", "lyrics for", "lyrics to", "words to", "what's the song that goes", "lyrics"]:
+                song_query_lyrics = re.sub(rf'(?i)\b{p_lyric}\b', '', song_query_lyrics, count=1).strip()
+            context.args = [song_query_lyrics] # Set context.args for get_lyrics_command
+            await get_lyrics_command(update, context)
+            return
+
+        # No specific intent matched, proceed to general chat
+        # typing_msg = await reply_with_retry("🎵 Thinking about music...") # This can be annoying if quick reply
+        ai_chat_response = await generate_chat_response(user_id, text)
+        # if typing_msg: await delete_message_with_retry(typing_msg)
+        await reply_with_retry(ai_chat_response)
+
+    except (TimedOut, NetworkError) as net_err:
+        logger.error(f"Network error in handle_message: {net_err}", exc_info=True)
+        try: await update.message.reply_text("Sorry, network hiccup. Please try again.")
+        except: pass
+    except Exception as main_handler_err:
+        logger.error(f"Error in enhanced_handle_message: {main_handler_err}", exc_info=True)
+        try: await update.message.reply_text("Oops, something went sideways. Try again?")
+        except: pass
 
 async def is_music_request(user_id: int, message: str) -> Dict:
     if not client: return {"is_music_request": False, "song_query": None}
@@ -678,6 +1090,21 @@ async def is_music_request(user_id: int, message: str) -> Dict:
         logger.error(f"Error in is_music_request: {e}", exc_info=True)
         return {"is_music_request": False, "song_query": None}
 
+async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if user_id in user_contexts and "conversation_history" in user_contexts[user_id]:
+        user_contexts[user_id]["conversation_history"] = []
+        await update.message.reply_text("✅ My memory of our chat has been cleared.")
+    else:
+        await update.message.reply_text("You don't have any saved conversation history with me yet.")
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message:
+        await update.message.reply_text("No problem! Feel free to chat or use commands anytime.")
+    elif update.callback_query:
+        await update.callback_query.edit_message_text("Action cancelled.")
+    return ConversationHandler.END
+
 async def analyze_conversation(user_id: int) -> Dict:
     default_return = {"genres": [], "artists": [], "mood": None}
     if not client: return default_return
@@ -690,22 +1117,22 @@ async def analyze_conversation(user_id: int) -> Dict:
     conv_history = user_context_data.get("conversation_history", [])
     spotify_context = user_context_data.get("spotify", {})
 
+    # Only analyze if there's enough data beyond basic mood/prefs
     if len(conv_history) < 2 and not spotify_context.get("recently_played") and not spotify_context.get("top_tracks"):
         return default_return
 
-    conv_text_short = "\n".join([f"{msg['role']}: {msg['content']}" for msg in conv_history[-10:]]) 
+    conv_text_short = "\n".join([f"{msg['role']}: {msg['content']}" for msg in conv_history[-10:]]) # Shorter history for this prompt
     
     spotify_summary_parts = []
     if spotify_context.get("recently_played"):
         rp_tracks = [f"{item['track']['name']} by {item['track']['artists'][0]['name']}" 
-                     for item in spotify_context.get("recently_played", [])[:3] # Add default empty list
-                     if item and item.get("track") and item["track"].get("artists") and item["track"]["artists"][0].get("name")] # More checks
+                     for item in spotify_context["recently_played"][:3] 
+                     if item.get("track") and item["track"].get("artists")]
         if rp_tracks: spotify_summary_parts.append("Recently played: " + ", ".join(rp_tracks))
-    
     if spotify_context.get("top_tracks"):
         tt_tracks = [f"{item['name']} by {item['artists'][0]['name']}" 
-                     for item in spotify_context.get("top_tracks", [])[:3] # Add default empty list
-                     if item and item.get("artists") and item["artists"][0].get("name")] # More checks
+                     for item in spotify_context["top_tracks"][:3] 
+                     if item.get("artists")]
         if tt_tracks: spotify_summary_parts.append("Top tracks: " + ", ".join(tt_tracks))
     
     spotify_data_summary = ". ".join(spotify_summary_parts)
@@ -729,548 +1156,29 @@ async def analyze_conversation(user_id: int) -> Dict:
             if not isinstance(result, dict): return default_return
         except json.JSONDecodeError: return default_return
 
+        # Merge results with existing, AI analysis can augment or override
         inferred_mood = result.get("mood") or current_mood
         
+        # Combine and unique-ify genres, giving precedence to AI if strong signal
         inferred_genres_raw = result.get("genres", [])
         inferred_genres = [g.strip().lower() for g in inferred_genres_raw if isinstance(g, str)] if isinstance(inferred_genres_raw, list) else []
-        final_genres = list(dict.fromkeys(inferred_genres + current_prefs))[:3] 
+        final_genres = list(dict.fromkeys(inferred_genres + current_prefs))[:3] # Max 3 genres
 
         inferred_artists_raw = result.get("artists", [])
         final_artists = [a.strip() for a in inferred_artists_raw if isinstance(a, str)] if isinstance(inferred_artists_raw, list) else []
-        final_artists = list(dict.fromkeys(final_artists))[:3] 
+        final_artists = list(dict.fromkeys(final_artists))[:3] # Max 3 artists
 
-        if inferred_mood and inferred_mood != current_mood: user_contexts.setdefault(user_id,{})["mood"] = inferred_mood
-        if final_genres and set(final_genres) != set(current_prefs): user_contexts.setdefault(user_id,{})["preferences"] = final_genres
-        
+        # Update user_contexts if analysis yielded new insights
+        if inferred_mood and inferred_mood != current_mood: user_contexts[user_id]["mood"] = inferred_mood
+        if final_genres and set(final_genres) != set(current_prefs): user_contexts[user_id]["preferences"] = final_genres
+        # We don't typically store artists long-term in context this way, but it's available for immediate recommendation
+
         return {"genres": final_genres, "artists": final_artists, "mood": inferred_mood}
     except Exception as e:
         logger.error(f"Error in analyze_conversation: {e}", exc_info=True)
         return default_return
-# ==================== INLINE KEYBOARD FOR SEARCH RESULTS ====================
-# ... (send_search_results, auto_download_first_result - no changes) ...
-async def send_search_results(update: Update, query: str, results: List[Dict]) -> None:
-    if not results:
-        await update.message.reply_text(f"Sorry, I couldn't find any songs for '{query}'.")
-        return
-    keyboard_buttons = []
-    for i, result in enumerate(results):
-        duration_str = ""
-        if result.get('duration') and isinstance(result['duration'], (int, float)) and result['duration'] > 0 : # Validate duration
-            minutes, seconds = divmod(int(result['duration']), 60)
-            duration_str = f" [{minutes}:{seconds:02d}]"
-        title = result.get('title', 'Unknown Title') # Use .get for safety
-        title = title[:37] + "..." if len(title) > 40 else title
-        button_text = f"{i+1}. {title}{duration_str}"
-        if result.get('id') and re.match(r'^[0-9A-Za-z_-]{11}$', result['id']): 
-            keyboard_buttons.append([InlineKeyboardButton(button_text, callback_data=f"download_{result['id']}")])
-    if not keyboard_buttons:
-        await update.message.reply_text(f"Sorry, no valid downloadable tracks found for '{query}'.")
-        return
-    keyboard_buttons.append([InlineKeyboardButton("Cancel", callback_data="cancel_search")])
-    reply_markup = InlineKeyboardMarkup(keyboard_buttons)
-    await update.message.reply_text(
-        f"🔎 Search results for '{query}':\n\nClick on a song to download:",
-        reply_markup=reply_markup)
-
-async def auto_download_first_result(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str) -> None:
-    user_id = update.effective_user.id
-    async with download_lock: 
-        if user_id in active_downloads:
-            await update.message.reply_text("⚠️ You already have a download in progress. Please wait.")
-            return
-        active_downloads.add(user_id)
-    status_msg = await update.message.reply_text(f"🔍 Searching for '{query}'...")
-    try:
-        results = search_youtube(query, max_results=1)
-        if not results or not results[0].get('id') or not re.match(r'^[0-9A-Za-z_-]{11}$', results[0].get('id','')): # Check ID exists before regex
-            await status_msg.edit_text(f"❌ Couldn't find a valid result for '{query}'.")
-            # active_downloads.remove(user_id) # Handled in finally
-            return 
-        result = results[0]
-        video_url = result.get("url")
-        if not video_url: # Should not happen if ID is present, but good check
-             await status_msg.edit_text(f"❌ Result for '{query}' has no URL.")
-             return
-        await status_msg.edit_text(f"✅ Found: {result['title']}\n⏳ Downloading...")
-        
-        download_result = await asyncio.to_thread(download_youtube_audio, video_url) 
-        
-        if not download_result["success"]:
-            await status_msg.edit_text(f"❌ Download failed: {download_result['error']}")
-            return
-        await status_msg.edit_text(f"✅ Downloaded: {download_result['title']}\n⏳ Sending file...")
-        with open(download_result["audio_path"], 'rb') as audio:
-            await update.message.reply_audio(
-                audio=audio,
-                title=download_result["title"][:64],
-                performer=download_result["artist"][:64] if download_result.get("artist") else "Unknown Artist",
-                caption=f"🎵 {download_result['title']}")
-        if os.path.exists(download_result["audio_path"]):
-            try: os.remove(download_result["audio_path"]); logger.info(f"Deleted file: {download_result['audio_path']}")
-            except Exception as e: logger.error(f"Error deleting file: {e}")
-        await status_msg.delete()
-    except Exception as e:
-        logger.error(f"Error in auto_download_first_result: {e}", exc_info=True)
-        if status_msg: 
-            try: await status_msg.edit_text(f"❌ Error: {str(e)[:200]}")
-            except: pass # If status_msg is already deleted or fails
-    finally:
-        async with download_lock:
-            if user_id in active_downloads: active_downloads.remove(user_id)
-
-# ==================== TELEGRAM BOT HANDLERS ====================
-# ... (start, help_command, download_music (lock already module level) - no changes) ...
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    await update.message.reply_text(
-        f"Hi {user.first_name}! 👋 I'm MelodyMind, your Music Healing Companion.\n\n"
-        "I can: 🎵 Download music 📜 Find lyrics 💿 Recommend music "
-        "💬 Chat about music & feelings 🔗 Link Spotify for personalized experience.\n\n"
-        "Try /help for commands, or just chat!")
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    help_text = (
-        "🎶 <b>MelodyMind Commands</b> 🎶\n"
-        "/start - Welcome\n/help - This message\n"
-        "/download [YouTube URL] or just send a link\n"
-        "/autodownload [song name] - Search & DL 1st result\n"
-        "/search [song name] - Show YouTube search options\n"
-        "/lyrics [song name / artist - song]\n"
-        "/recommend - Personalized music recommendations\n"
-        "/mood - Set your current mood\n"
-        "/link_spotify - Connect your Spotify\n"
-        "/clear - Clear my memory of our chat\n\n"
-        "<b>Or just chat naturally!</b> Examples:\n"
-        "- \"I'm feeling sad, suggest some songs.\"\n"
-        "- \"Play Shape of You by Ed Sheeran\"\n"
-        "- \"What are the lyrics to Bohemian Rhapsody?\"")
-    await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
-
-download_lock = asyncio.Lock() 
-async def download_music(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    url = None
-    if context.args: url = " ".join(context.args)
-    elif update.message and update.message.text:
-        words = update.message.text.split()
-        valid_urls = [word for word in words if is_valid_youtube_url(word)]
-        if valid_urls: url = valid_urls[0]
-    
-    if not url or not is_valid_youtube_url(url):
-        await update.message.reply_text("❌ Please provide a valid YouTube URL or send a message containing one.")
-        return
-
-    user_id = update.effective_user.id
-    async with download_lock:
-        if user_id in active_downloads:
-            await update.message.reply_text("⚠️ You already have a download in progress. Please wait.")
-            return
-        active_downloads.add(user_id)
-    status_msg = await update.message.reply_text("⏳ Starting download...")
-    try:
-        await status_msg.edit_text("🔍 Fetching video information...")
-        result = await asyncio.to_thread(download_youtube_audio, url) 
-        if not result["success"]:
-            await status_msg.edit_text(f"❌ Download failed: {result['error']}")
-            return 
-        await status_msg.edit_text(f"✅ Downloaded: {result['title']}\n⏳ Sending file...")
-        with open(result["audio_path"], 'rb') as audio_file:
-            await update.message.reply_audio(
-                audio=audio_file, title=result["title"][:64],
-                performer=result["artist"][:64] if result.get("artist") else "Unknown Artist",
-                caption=f"🎵 {result['title']}")
-        if os.path.exists(result["audio_path"]):
-            try: os.remove(result["audio_path"]); logger.info(f"Deleted file: {result['audio_path']}")
-            except Exception as e: logger.error(f"Error deleting file {result['audio_path']}: {e}")
-        await status_msg.delete()
-    except Exception as e:
-        logger.error(f"Error in download_music: {e}", exc_info=True)
-        if status_msg : 
-            try: await status_msg.edit_text("❌ An error occurred. Please try again.")
-            except: pass
-    finally:
-        async with download_lock:
-            if user_id in active_downloads: active_downloads.remove(user_id)
-
-async def link_spotify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # ... (link_spotify - no changes needed from previous version) ...
-    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET or not SPOTIFY_REDIRECT_URI:
-        await update.message.reply_text("Sorry, Spotify linking is not available (misconfigured).")
-        return ConversationHandler.END
-    user_id = update.effective_user.id
-    auth_url = (f"https://accounts.spotify.com/authorize?client_id={SPOTIFY_CLIENT_ID}"
-                f"&response_type=code&redirect_uri={SPOTIFY_REDIRECT_URI}"
-                f"&scope=user-read-recently-played%20user-top-read%20playlist-read-private" 
-                f"&state={user_id}") 
-    keyboard = [[InlineKeyboardButton("🔗 Link Spotify", url=auth_url)],
-                [InlineKeyboardButton("Cancel", callback_data="cancel_spotify")]]
-    await update.message.reply_text(
-        "🔗 Let's link your Spotify! \n1. Click below. \n2. Log in & authorize. \n3. Copy the code from the page. \n4. Send the code back to me here.",
-        reply_markup=InlineKeyboardMarkup(keyboard))
-    return SPOTIFY_CODE
-
-# THIS IS THE FIXED spotify_code_handler
-async def spotify_code_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.effective_user.id
-    code = None
-    if update.message and update.message.text:
-        message_text = update.message.text.strip()
-        if not message_text.startswith('/'): # Regular text could be a code
-            code = message_text
-        # Allow /spotify_code <CODE> even when in conversation state
-        elif message_text.startswith('/spotify_code') and context.args: 
-            code = context.args[0]
-    
-    if not code:
-        await update.message.reply_text(
-            "Please send the Spotify authorization code you received. "
-            "You can just paste the code directly, or use /spotify_code <code>."
-        )
-        return SPOTIFY_CODE # Stay in this state to re-prompt for code
-
-    logger.info(f"Received Spotify code from user {user_id}: {code[:10]}...") # Log partial code
-    
-    # Run the synchronous get_user_spotify_token in a separate thread
-    token_data = await asyncio.to_thread(get_user_spotify_token, user_id, code) 
-
-    if not token_data or not token_data.get("access_token"):
-        await update.message.reply_text(
-            "❌ Failed to link Spotify. The code might be invalid or expired. "
-            "Please try /link_spotify again to get a new link and code."
-        )
-        return ConversationHandler.END # MODIFIED: End the conversation cleanly on failure.
-
-    # If successful:
-    user_contexts.setdefault(user_id, {}).setdefault("spotify", {}).update({
-        "access_token": token_data.get("access_token"),
-        "refresh_token": token_data.get("refresh_token"),
-        "expires_at": token_data.get("expires_at")
-    })
-    
-    # Fetch initial data
-    logger.info(f"Spotify successfully linked for user {user_id}. Fetching initial data.")
-    recently_played = await get_user_spotify_data_async(user_id, "player/recently-played")
-    if recently_played is not None: 
-        user_contexts.setdefault(user_id, {}).setdefault("spotify", {})["recently_played"] = recently_played
-
-    await update.message.reply_text(
-        "✅ Spotify account linked successfully! 🎉\n"
-        "I can now use your listening history to recommend music. Try /recommend to get started!"
-    )
-    return ConversationHandler.END # Correct: End the conversation on success.
-
-async def spotify_code_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # ... (spotify_code_command - no changes needed) ...
-    if not context.args:
-        await update.message.reply_text("Please provide the code: /spotify_code <code>")
-        return
-    # This will effectively call the spotify_code_handler logic if the conversation isn't active,
-    # or be handled by the ConversationHandler if it is.
-    # To be absolutely sure it doesn't interfere if a convo IS active, we might make it
-    # explicitly NOT enter a convo if it's just this command.
-    # However, current setup reuses it if ConversationHandler picks it up.
-    # If outside a convo, it needs its own logic or a way to pass to a generic code handler.
-    # For simplicity now, this assumes spotify_code_handler can be called stand-alone
-    # or PTB will route it correctly based on ConversationHandler states.
-    
-    # To ensure it uses the same logic when no conversation is active:
-    temp_convo_active = bool(context.user_data.get(ConversationHandler.CONVERSATION_KEY)) # Check if in any convo state from this handler
-
-    if temp_convo_active: # If in SPOTIFY_CODE state, it will be handled by the convo's MessageHandler or CommandHandler
-        # Let the ConversationHandler deal with it
-        # Or we could force a state transition here if complex logic is needed
-        pass # Should be handled by the ConversationHandler
-    else: # No active Spotify conversation, handle as a standalone command
-        mock_message = update.message # Create a pseudo-update to pass to spotify_code_handler
-        mock_message.text = f"/spotify_code {context.args[0]}" # Ensure context.args[0] is the code
-        
-        # We are calling it as if it's a normal handler.
-        # Since spotify_code_handler expects to return a state for ConversationHandler,
-        # we might need a wrapper or a separate non-convo handler if used standalone often.
-        # For now, let's assume this use case is less common and just log it.
-        logger.info(f"/spotify_code command used outside conversation by {update.effective_user.id}")
-        # The original `spotify_code_handler` will reply and handle.
-        # It does not require a return value here as it's not driving a ConversationHandler state transition.
-        await spotify_code_handler(update, context) # Call it, its return value will be ignored here
-
-
-async def cancel_spotify(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # ... (cancel_spotify - no changes needed) ...
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("Spotify linking cancelled. /link_spotify to try again.")
-    return ConversationHandler.END
-
-async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # ... (search_command - no changes needed) ...
-    if not context.args:
-        await update.message.reply_text("What to search? /search Shape of You Ed Sheeran")
-        return
-    query = " ".join(context.args)
-    status_msg = await update.message.reply_text(f"🔍 Searching YouTube for: '{query}'...")
-    results = search_youtube(query) 
-    if status_msg: await status_msg.delete()
-    await send_search_results(update, query, results)
-
-async def auto_download_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # ... (auto_download_command - no changes needed) ...
-    if not context.args:
-        await update.message.reply_text("What song? /autodownload Shape of You Ed Sheeran")
-        return
-    query = " ".join(context.args)
-    await auto_download_first_result(update, context, query)
-
-async def provide_generic_recommendations(update: Update, mood: str) -> None:
-    # ... (provide_generic_recommendations - no changes needed) ...
-    mood_recommendations = {
-        "happy": ["Walking on Sunshine - Katrina & The Waves", "Happy - Pharrell Williams"],
-        "sad": ["Someone Like You - Adele", "Fix You - Coldplay"],
-        "energetic": ["Eye of the Tiger - Survivor", "Don't Stop Me Now - Queen"],
-        "relaxed": ["Weightless - Marconi Union", "Clair de Lune - Claude Debussy"],
-        "focused": ["The Four Seasons - Vivaldi", "Time - Hans Zimmer"],
-        "nostalgic": ["Yesterday - The Beatles", "Vienna - Billy Joel"]
-    } 
-    recommendations = mood_recommendations.get(mood.lower(), mood_recommendations["happy"])
-    response = f"🎵 <b>Some {mood.capitalize()} music ideas:</b>\n" + "\n".join([f"{i+1}. {track}" for i, track in enumerate(recommendations)])
-    response += "\n\n💡 <i>Send a YouTube link to download!</i>"
-    if update.callback_query and update.callback_query.message: 
-        try: await update.callback_query.message.edit_text(response, parse_mode=ParseMode.HTML)
-        except Exception as e: # If edit fails (e.g. message too old, or not changed)
-            logger.warning(f"Failed to edit message for generic recommendations: {e}")
-            await update.callback_query.message.reply_text(response, parse_mode=ParseMode.HTML) # Send new
-    elif update.message:
-        await update.message.reply_text(response, parse_mode=ParseMode.HTML)
-
-
-async def set_mood(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # ... (set_mood - no changes needed) ...
-    keyboard = [
-        [InlineKeyboardButton("Happy 😊", callback_data="mood_happy"), InlineKeyboardButton("Sad 😢", callback_data="mood_sad")],
-        [InlineKeyboardButton("Energetic 💪", callback_data="mood_energetic"), InlineKeyboardButton("Relaxed 😌", callback_data="mood_relaxed")],
-        [InlineKeyboardButton("Focused 🧠", callback_data="mood_focused"), InlineKeyboardButton("Nostalgic 🕰️", callback_data="mood_nostalgic")],
-    ]
-    await update.message.reply_text("How are you feeling today?", reply_markup=InlineKeyboardMarkup(keyboard))
-    return MOOD
-
-async def enhanced_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Union[int, None]:
-    # ... (enhanced_button_handler - minor async wrap for download_youtube_audio) ...
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    user_id = query.from_user.id
-    logger.debug(f"Callback: {data} for user {user_id}")
-
-    if data.startswith("mood_"):
-        mood = data.split("_")[1]
-        user_contexts.setdefault(user_id, {}).update({"mood": mood, "preferences": user_contexts.get(user_id, {}).get("preferences", [])})
-        keyboard_genres = [
-            [InlineKeyboardButton("Pop", callback_data="pref_pop"), InlineKeyboardButton("Rock", callback_data="pref_rock"), InlineKeyboardButton("Hip-Hop", callback_data="pref_hiphop")],
-            [InlineKeyboardButton("Classical", callback_data="pref_classical"), InlineKeyboardButton("Electronic", callback_data="pref_electronic"), InlineKeyboardButton("Jazz", callback_data="pref_jazz")],
-            [InlineKeyboardButton("Skip", callback_data="pref_skip")],]
-        await query.edit_message_text(f"Got it! You're feeling {mood}. 🎶\n\nAny specific music genre preference?", reply_markup=InlineKeyboardMarkup(keyboard_genres))
-        return PREFERENCE
-    elif data.startswith("pref_"):
-        preference = data.split("_")[1]
-        current_prefs = user_contexts.setdefault(user_id, {}).setdefault("preferences", [])
-        if preference != "skip" and preference not in current_prefs : current_prefs.append(preference) # Append unique
-        user_contexts[user_id]["preferences"] = current_prefs[:3] # Keep max 3
-        await query.edit_message_text("Great! Try /recommend, /download, /lyrics, or just chat!")
-        return ConversationHandler.END
-    elif data.startswith("download_") or data.startswith("auto_download_"):
-        video_id = data.split("_")[-1] 
-        if not re.match(r'^[0-9A-Za-z_-]{11}$', video_id):
-            logger.error(f"Invalid YouTube video ID from callback: {video_id}")
-            await query.edit_message_text("❌ Invalid video ID. Try another song.")
-            return None
-        
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        await query.edit_message_text(f"⏳ Starting download for yt.be/{video_id}...")
-        
-        async with download_lock:
-            if user_id in active_downloads:
-                await query.edit_message_text("⚠️ You already have a download in progress. Please wait.")
-                return None
-            active_downloads.add(user_id)
-        try:
-            result = await asyncio.to_thread(download_youtube_audio, url) 
-            if not result["success"]:
-                await query.edit_message_text(f"❌ Download failed: {result['error']}")
-                return None # Handled in finally
-            await query.edit_message_text(f"✅ Downloaded: {result['title']}\n⏳ Sending file...")
-            
-            @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-            async def send_audio_with_retry_cb():
-                async with httpx.AsyncClient(timeout=60.0) as temp_client:
-                    original_bot_client = context.bot.request._client
-                    context.bot.request._client = temp_client
-                    try:
-                        with open(result["audio_path"], 'rb') as audio_file_cb:
-                            return await context.bot.send_audio(
-                                chat_id=query.message.chat_id, audio=audio_file_cb,
-                                title=result["title"][:64],
-                                performer=result["artist"][:64] if result.get("artist") else "Unknown Artist",
-                                caption=f"🎵 {result['title']}")
-                    finally: context.bot.request._client = original_bot_client
-            
-            await send_audio_with_retry_cb()
-            
-            @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=5))
-            async def edit_final_message():
-                 await query.edit_message_text(f"✅ Download complete: {result['title']}")
-
-            if os.path.exists(result["audio_path"]):
-                try: os.remove(result["audio_path"]); logger.info(f"Deleted file: {result['audio_path']}")
-                except Exception as e_del: logger.error(f"Error deleting file {result['audio_path']}: {e_del}")
-            await edit_final_message()
-        except Exception as e_btn:
-            logger.error(f"Error in button download for video {video_id}: {e_btn}", exc_info=True)
-            try: await query.edit_message_text(f"❌ Error during download: {str(e_btn)[:150]}") # Shorter error
-            except Exception: pass 
-        finally:
-            async with download_lock:
-                if user_id in active_downloads: active_downloads.remove(user_id)
-        return None
-    elif data.startswith("show_options_"):
-        search_query = data.split("show_options_")[1]
-        results = search_youtube(search_query) 
-        if not results: await query.edit_message_text(f"Sorry, no YouTube songs for '{search_query}'."); return None
-        keyboard_show = []
-        for i, res_item in enumerate(results[:5]):
-            if not res_item.get('id') or not re.match(r'^[0-9A-Za-z_-]{11}$', res_item.get('id','')): continue # Check ID
-            if not res_item.get('title'): continue # Skip if no title
-            mins, secs = divmod(int(res_item.get('duration', 0)), 60)
-            dur_str = f" [{mins}:{secs:02d}]" if res_item.get('duration', 0) > 0 else ""
-            title_disp = res_item['title'][:37] + "..." if len(res_item['title']) > 40 else res_item['title']
-            keyboard_show.append([InlineKeyboardButton(f"{i+1}. {title_disp}{dur_str}", callback_data=f"download_{res_item['id']}")])
-        if not keyboard_show: await query.edit_message_text(f"No valid YouTube results for '{search_query}'."); return None
-        keyboard_show.append([InlineKeyboardButton("Cancel", callback_data="cancel_search")])
-        await query.edit_message_text(f"🔎 Results for '{search_query}':\nClick to download:", reply_markup=InlineKeyboardMarkup(keyboard_show))
-        return None
-    elif data == "cancel_search": await query.edit_message_text("❌ Search cancelled."); return None
-    elif data == "cancel_spotify": await query.edit_message_text("❌ Spotify linking cancelled."); return ConversationHandler.END
-    return None 
-
-async def handle_error(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # ... (handle_error - no changes needed) ...
-    logger.error(f"Update {update} caused error {context.error}", exc_info=True)
-    effective_chat = update.effective_chat
-    if not effective_chat: # Should not happen with most updates handled
-        logger.error("handle_error called with an update without an effective_chat")
-        return
-
-    error_message = "Sorry, something went wrong. Please try again later."
-    try:
-        if update.effective_message: # Prefer replying to the original message if possible
-            await update.effective_message.reply_text(error_message)
-        else: # Fallback to sending a new message to the chat
-            await context.bot.send_message(chat_id=effective_chat.id, text=error_message)
-    except (TimedOut, NetworkError) as e_reply:
-        logger.error(f"Failed to send error message to user {effective_chat.id}: {e_reply}")
-        # Further fallback or just log if even this fails
-    except Exception as e_send:
-        logger.error(f"Unexpected error when trying to send error message to {effective_chat.id}: {e_send}")
-
-async def enhanced_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # ... (enhanced_handle_message - minor async/sync handling improvements) ...
-    if not update.message or not update.message.text : return 
-    user_id = update.effective_user.id
-    text = sanitize_input(update.message.text)
-    logger.debug(f"Sanitized message from {user_id}: {text[:50]}...")
-
-    @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=1, max=3))
-    async def reply_with_retry(msg_text, reply_markup=None):
-        async with httpx.AsyncClient(timeout=20.0) as temp_http_client:
-            original_bot_client = context.bot.request._client
-            context.bot.request._client = temp_http_client
-            try: return await update.message.reply_text(msg_text, reply_markup=reply_markup)
-            finally: context.bot.request._client = original_bot_client
-    @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=1, max=3))
-    async def delete_message_with_retry(message_to_delete):
-        if not message_to_delete: return # Guard against None
-        async with httpx.AsyncClient(timeout=10.0) as temp_http_client_del: 
-            original_bot_client_del = context.bot.request._client
-            context.bot.request._client = temp_http_client_del
-            try: return await message_to_delete.delete()
-            finally: context.bot.request._client = original_bot_client_del
-    try:
-        if is_valid_youtube_url(text):
-            await download_music(update, context) 
-            return
-
-        detected_song_query = detect_music_in_message(text)
-        if detected_song_query:
-            if detected_song_query == "AI_ANALYSIS_NEEDED":
-                ai_song_detection = await is_music_request(user_id, text)
-                detected_song_query = ai_song_detection.get("song_query") if ai_song_detection.get("is_music_request") else None
-            if detected_song_query:
-                status_msg_search = await reply_with_retry(f"🔍 Searching YouTube for: '{detected_song_query}'...")
-                yt_results = await asyncio.to_thread(search_youtube, detected_song_query) # Run sync search in thread
-                if status_msg_search: await delete_message_with_retry(status_msg_search)
-                
-                if not yt_results or not yt_results[0].get('id') or not re.match(r'^[0-9A-Za-z_-]{11}$', yt_results[0].get('id','')):
-                    await reply_with_retry(f"Sorry, no valid YouTube songs found for '{detected_song_query}'.")
-                    return
-                first_yt_result = yt_results[0]
-                keyboard_confirm = [
-                    [InlineKeyboardButton("✅ Yes, download it", callback_data=f"auto_download_{first_yt_result['id']}")],
-                    [InlineKeyboardButton("👀 Show me options", callback_data=f"show_options_{detected_song_query}")],
-                    [InlineKeyboardButton("❌ No, cancel", callback_data="cancel_search")]]
-                uploader_name = first_yt_result.get('uploader', 'Unknown Artist') # Default for uploader
-                await reply_with_retry(f"Found '{first_yt_result['title']}' by {uploader_name}.\nDownload this?", reply_markup=InlineKeyboardMarkup(keyboard_confirm))
-                return
-        
-        lower_text = text.lower()
-        if any(p in lower_text for p in ["lyrics", "words to", "song that goes"]):
-            song_query_lyrics = text
-            # More robustly remove phrases only if they appear as distinct words/phrases
-            phrases_to_remove = ["lyrics of", "lyrics for", "lyrics to", "words to", "what are the lyrics to", "what's the song that goes", "lyrics"]
-            for p_lyric in phrases_to_remove:
-                # Use regex to ensure it's a whole word/phrase match and case-insensitive
-                song_query_lyrics = re.sub(rf'(?i)\b{re.escape(p_lyric)}\b\s*', '', song_query_lyrics, count=1).strip()
-
-            if not song_query_lyrics.strip(): # If removing phrases left it empty
-                 await reply_with_retry("Please specify which song's lyrics you want after the phrase (e.g., 'lyrics Bohemian Rhapsody').")
-                 return
-
-            context.args = [song_query_lyrics] 
-            await get_lyrics_command(update, context)
-            return
-        
-        ai_chat_response = await generate_chat_response(user_id, text)
-        await reply_with_retry(ai_chat_response)
-
-    except (TimedOut, NetworkError) as net_err:
-        logger.error(f"Network error in handle_message: {net_err}", exc_info=True)
-        try: await update.message.reply_text("Sorry, network hiccup. Please try again.")
-        except: pass
-    except Exception as main_handler_err:
-        logger.error(f"Error in enhanced_handle_message: {main_handler_err}", exc_info=True)
-        try: await update.message.reply_text("Oops, something went sideways. Try again?")
-        except: pass
-
-
-async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # ... (clear_history - no changes needed) ...
-    user_id = update.effective_user.id
-    if user_id in user_contexts and "conversation_history" in user_contexts[user_id]:
-        user_contexts[user_id]["conversation_history"] = []
-        await update.message.reply_text("✅ My memory of our chat has been cleared.")
-    else:
-        await update.message.reply_text("You don't have any saved conversation history with me yet.")
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # ... (cancel - no changes needed) ...
-    if update.message:
-        await update.message.reply_text("No problem! Feel free to chat or use commands anytime.")
-    elif update.callback_query and update.callback_query.message: # Check if message exists
-        try:
-            await update.callback_query.edit_message_text("Action cancelled.")
-        except Exception as e: # Handle cases where edit might fail (e.g. message too old)
-            logger.warning(f"Failed to edit message on cancel callback: {e}")
-            await update.callback_query.message.reply_text("Action cancelled.")
-
-    return ConversationHandler.END
+      
 # ==================== CLEANUP & SIGNAL HANDLING ====================
-# ... (cleanup_downloads, signal_handler - no changes) ...
 def cleanup_downloads() -> None:
     try:
         if os.path.exists(DOWNLOAD_DIR):
@@ -1283,17 +1191,12 @@ def cleanup_downloads() -> None:
     except Exception as e: logger.error(f"Error cleaning up downloads: {e}")
 
 def signal_handler(sig, frame) -> None:
-    logger.info(f"Received signal {sig}, cleaning up and exiting...")
-    cleanup_downloads() 
-    # Perform any other necessary cleanup before exiting
-    # For asyncio applications, ensure tasks are cancelled or awaited if needed
-    # However, for a hard signal like SIGINT/SIGTERM, immediate exit after cleanup is often the goal.
+    logger.info("Received termination signal, cleaning up...")
+    cleanup_downloads() # Call cleanup
     sys.exit(0)
-
 
 # ==================== MAIN FUNCTION ====================
 def main() -> None:
-    # ... (main function - handler registration - ensure pattern for cancel_spotify is specific)
     required_env_vars = ["TELEGRAM_TOKEN", "OPENAI_API_KEY", "SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET", "GENIUS_ACCESS_TOKEN"]
     if any(not os.getenv(var) for var in required_env_vars):
         missing = [var for var in required_env_vars if not os.getenv(var)]
@@ -1304,6 +1207,7 @@ def main() -> None:
    
     application = Application.builder().token(TOKEN).build()
 
+    # Command Handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("download", download_music))
@@ -1312,37 +1216,44 @@ def main() -> None:
     application.add_handler(CommandHandler("lyrics", get_lyrics_command))
     application.add_handler(CommandHandler("recommend", recommend_music))
     application.add_handler(CommandHandler("clear", clear_history))
-    application.add_handler(CommandHandler("spotify_code", spotify_code_command)) 
+    application.add_handler(CommandHandler("spotify_code", spotify_code_command)) # For direct code input
 
+    # Spotify Linking Conversation
     spotify_conv_handler = ConversationHandler(
         entry_points=[CommandHandler("link_spotify", link_spotify)],
         states={SPOTIFY_CODE: [
             MessageHandler(filters.TEXT & ~filters.COMMAND, spotify_code_handler),
-            CommandHandler("spotify_code", spotify_code_handler), 
-            CallbackQueryHandler(cancel_spotify, pattern="^cancel_spotify$") # Specific pattern
+            CommandHandler("spotify_code", spotify_code_handler), # Allow /spotify_code within convo
+            CallbackQueryHandler(cancel_spotify, pattern="^cancel_spotify$")
         ]},
         fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(cancel, pattern="^cancel$")])
     application.add_handler(spotify_conv_handler)
 
+    # Mood Setting Conversation
     mood_conv_handler = ConversationHandler(
         entry_points=[CommandHandler("mood", set_mood)],
         states={
             MOOD: [CallbackQueryHandler(enhanced_button_handler, pattern="^mood_")],
             PREFERENCE: [CallbackQueryHandler(enhanced_button_handler, pattern="^pref_")]
+            # ACTION state was not clearly used/defined, removed for now unless its purpose is clarified
         },
         fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(cancel, pattern="^cancel$")])
     application.add_handler(mood_conv_handler)
+
+    # General Callback Handler (for downloads from search, etc.)
+    # Ensure patterns are specific enough not to clash with ConversationHandler ones
+    application.add_handler(CallbackQueryHandler(enhanced_button_handler, pattern="^(download_|auto_download_|show_options_|cancel_search$)"))
     
-    # More specific pattern for general callbacks to avoid clashes
-    application.add_handler(CallbackQueryHandler(enhanced_button_handler, pattern="^(download_|auto_download_|show_options_|cancel_search$)")) 
-    
+    # General Message Handler (must be last among message handlers)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, enhanced_handle_message))
     
+    # Error Handler
     application.add_error_handler(handle_error)
 
+    # Signal Handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    atexit.register(cleanup_downloads) 
+    atexit.register(cleanup_downloads) # Fallback cleanup on normal exit
 
     logger.info("🚀 Enhanced MelodyMind Bot is starting polling... 🎶")
     application.run_polling()
