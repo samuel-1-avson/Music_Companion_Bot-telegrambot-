@@ -537,7 +537,7 @@ async def generate_chat_response(user_id: int, message: str) -> str:
     try:
         response = await asyncio.to_thread(
             client.chat.completions.create,
-            model="gpt-4-turbo",
+            model="gpt-3.5-turbo",
             messages=messages,
             max_tokens=150, # Increased from 100
             temperature=0.75
